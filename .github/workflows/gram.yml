@@ -223,11 +223,17 @@ jobs:
               elseif ($result.After.RealTimeProtectionEnabled -ne $true) { [void]$problems.Add("$name After.RealTimeProtectionEnabled=$($result.After.RealTimeProtectionEnabled)") }
               continue
             }
-            $methods = @($result.Methods.PSObject.Properties)
-            if ($methods.Count -eq 0) { [void]$problems.Add("$name has no Methods") }
+            $methods = @()
+            if ($null -eq $result.Methods) { [void]$problems.Add("$name has no Methods") }
+            else { $methods = @($result.Methods.PSObject.Properties | Where-Object { $_ }) }
+            if ($null -ne $result.Methods -and $methods.Count -eq 0) { [void]$problems.Add("$name has empty Methods") }
             foreach ($method in $methods) {
-              $kinds = @($method.Value.ByKind.PSObject.Properties)
-              if ($kinds.Count -eq 0) { [void]$problems.Add("$name $($method.Name) has no ByKind") }
+              $kinds = @()
+              if ($null -eq $method.Value.ByKind) { [void]$problems.Add("$name $($method.Name) has no ByKind") }
+              else { $kinds = @($method.Value.ByKind.PSObject.Properties | Where-Object { $_ }) }
+              foreach ($expected in @("zero", "rare", "sample3", "sample2")) {
+                if (@($kinds | Where-Object { $_.Name -eq $expected }).Count -eq 0) { [void]$problems.Add("$name $($method.Name) has no kind $expected") }
+              }
               if ($name -like "*_blocks") { continue }
               foreach ($kind in $kinds) {
                 if ($null -eq $kind.Value.Missing) { [void]$problems.Add("$name $($method.Name) $($kind.Name) has no Missing") }
@@ -240,6 +246,9 @@ jobs:
               $rewrite = $result.RewriteCheck
               if ($null -eq $rewrite) { [void]$problems.Add("$name has no RewriteCheck") }
               else {
+                foreach ($field in @("OldWordCount", "NewWordCount", "OldStaleNaive", "OldStaleNewest", "NewFoundNaive", "NewFoundNewest")) {
+                  if ($null -eq $rewrite.$field) { [void]$problems.Add("$name RewriteCheck has no $field") }
+                }
                 if ([int]$rewrite.OldWordCount -le 0) { [void]$problems.Add("$name RewriteCheck.OldWordCount=$($rewrite.OldWordCount)") }
                 if ([int]$rewrite.OldStaleNewest -gt 0) { [void]$problems.Add("$name RewriteCheck.OldStaleNewest=$($rewrite.OldStaleNewest)") }
                 if ([int]$rewrite.NewFoundNewest -ne [int]$rewrite.NewWordCount) { [void]$problems.Add("$name RewriteCheck.NewFoundNewest=$($rewrite.NewFoundNewest) NewWordCount=$($rewrite.NewWordCount)") }
