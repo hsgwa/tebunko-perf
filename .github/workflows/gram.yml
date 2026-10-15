@@ -1,5 +1,5 @@
 # 2-gram 索引の形ごとの大きさ・作成時間・検索時間・最大メモリを測る（tools/measure_gram.ps1）。
-# 測る道具を直した push と、その PR で動く。結果はジョブの Summary と artifact に出す。
+# 測る道具を直した PR（pull_request）と、main への push、手で動かす workflow_dispatch で動く。結果はジョブの Summary と artifact に出す。
 #
 # データは 2 通りを別のジョブで測る。
 #   perfdata: tebunko-perfdata の new_index.ps1 で作る約 1GB の索引（部署ごと・年度ごとのフォルダを本文インデックス 1 ファイルに見立てる）
@@ -206,5 +206,25 @@ jobs:
           $missing = @($names | Where-Object { !(Test-Path -LiteralPath (Join-Path $out "$_.json")) })
           if ($missing.Count -gt 0) {
             Write-Host ("missing results: " + ($missing -join ", "))
+            exit 1
+          }
+          # Fail on: Missing > 0 for file-unit searches, DifferentCandidates > 0, RewriteCheck.OldStaleNewest > 0.
+          # Block-unit searches (search_*_blocks) may miss words that cross a block boundary, so they are skipped.
+          $problems = New-Object System.Collections.ArrayList
+          foreach ($name in $names) {
+            if ($name -like "*_blocks" -or ($name -notlike "search_*" -and $name -notlike "segsearch_*")) { continue }
+            $result = Get-Content -LiteralPath (Join-Path $out "$name.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+            foreach ($method in $result.Methods.PSObject.Properties) {
+              foreach ($kind in $method.Value.ByKind.PSObject.Properties) {
+                if ([int]$kind.Value.Missing -gt 0) { [void]$problems.Add("$name $($method.Name) $($kind.Name) Missing=$($kind.Value.Missing)") }
+              }
+            }
+            if ($name -like "segsearch_*") {
+              if ([int]$result.DifferentCandidates -gt 0) { [void]$problems.Add("$name DifferentCandidates=$($result.DifferentCandidates)") }
+              if ($null -ne $result.RewriteCheck -and [int]$result.RewriteCheck.OldStaleNewest -gt 0) { [void]$problems.Add("$name RewriteCheck.OldStaleNewest=$($result.RewriteCheck.OldStaleNewest)") }
+            }
+          }
+          if ($problems.Count -gt 0) {
+            Write-Host ("check failed: " + ($problems -join "; "))
             exit 1
           }

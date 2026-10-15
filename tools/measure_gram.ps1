@@ -5,7 +5,9 @@
 # Add-Type・P/Invoke・子プロセスは使わない（段階ごとに別のプロセスで動かすのは、呼ぶ側のワークフロー）。
 #
 # 段階（-Stage）:
-#   どの段階も、前の段階が作るフォルダが無くても落ちずに動くこと（無いものは記録して続ける）。手元の確かめは、段階ごとに別のプロセスで単独に流す。
+#   前の段階の結果が要る段階（無いと止まる）: build・segbuild・merge・segsearch は prep の grams\meta.json、search は prep の queries.json・unitfile.bin と build の表、
+#   merge は segbuild の seg_base、segsearch は merge の merged_N と build の shape_list_files を読む。
+#   defenderon・prep・summary は単独で動く。share・defender は、前の段階のファイルが無ければ、その項目を飛ばして記録する。
 #   defenderon リアルタイム保護を有効にする方向に設定を変え、前後の状態を記録する（無効にする方向の変更はしない）
 #   prep      データを作り（または読み）、ファイルごと・ブロックごとの 2-gram の集合を Work\grams に書く。検索語の表も作る
 #   build     -Shape（list / bitset / mixed）と -Unit（files / blocks）の表を作る。-Label で結果の名前に印を付ける（-Parts を変えた作り直しなど）
@@ -612,8 +614,6 @@ function buildParts {
         } elseif ($shape -eq "bitset") {
             writeArraySlice $dictStream $dict 4 $dictBase $groupCount
             $dictStream.Flush()
-            $rowStreamForBits = $null
-            if ($null -eq $rowStream) { $rowStream = [System.IO.File]::Create((Join-Path $folder "rows.bin"), 1MB) }
             writeArraySlice $rowStream $bits 1 0 ($groupCount * $stride)
         } else {
             writeArraySlice $dictStream $lightDict 4 0 $lightGroupCount
@@ -1267,11 +1267,8 @@ function measureOpen {
 }
 
 function invokeDefender {
-    $status = $null
-    try {
-        $mp = Get-MpComputerStatus
-        $status = [ordered]@{ RealTimeProtectionEnabled = $mp.RealTimeProtectionEnabled; AMServiceEnabled = $mp.AMServiceEnabled; AntivirusEnabled = $mp.AntivirusEnabled }
-    } catch { $status = [ordered]@{ Error = $_.Exception.Message } }
+    # Defender の設定は CI の実行機の上だけで読む（除外が残っていないかも記録する）
+    $status = if (isCiRunner) { getDefenderState } else { [ordered]@{ Skipped = "CI の実行機ではないので読まない" } }
     $folder = Join-Path $Work "defender"
     [void][System.IO.Directory]::CreateDirectory($folder)
     $files = New-Object System.Collections.ArrayList
@@ -1300,6 +1297,10 @@ function invokeDefender {
 
 # ---------------------------------------------------------------- defenderon（リアルタイム保護を有効にする試み）
 
+function isCiRunner {
+    return ($env:GITHUB_ACTIONS -eq "true")
+}
+
 function getDefenderState {
     try {
         $computer = Get-MpComputerStatus
@@ -1309,20 +1310,55 @@ function getDefenderState {
             AMServiceEnabled          = $computer.AMServiceEnabled
             AntivirusEnabled          = $computer.AntivirusEnabled
             DisableRealtimeMonitoring = $preference.DisableRealtimeMonitoring
+            DisableIOAVProtection     = $preference.DisableIOAVProtection
+            DisableBehaviorMonitoring = $preference.DisableBehaviorMonitoring
+            ExclusionPath             = @($preference.ExclusionPath | ForEach-Object { [string]$_ })
+            ExclusionExtension        = @($preference.ExclusionExtension | ForEach-Object { [string]$_ })
+            ExclusionProcess          = @($preference.ExclusionProcess | ForEach-Object { [string]$_ })
         }
     } catch { return [ordered]@{ Error = $_.Exception.Message } }
 }
 
+function testExclusionCovers {
+    # 除外の道（D:\ や D:\a など）が、調べるフォルダを含むか
+    param ([string]$exclusion, [string]$target)
+    $trimmed = $exclusion.TrimEnd('\')
+    if ($trimmed.Length -eq 0) { return $false }
+    return ($target.Equals($trimmed, [System.StringComparison]::OrdinalIgnoreCase) -or $target.StartsWith($trimmed + "\", [System.StringComparison]::OrdinalIgnoreCase))
+}
+
 function invokeDefenderOn {
-    # CI の実行機の上だけで、リアルタイム保護を有効にする方向に変える。無効にする方向の変更はしない
+    # CI の実行機の上だけで、保護を強める方向に変える（リアルタイム保護を有効にする・作業フォルダを含む除外を外す）。弱める方向の変更はしない。
+    # 手元では設定を読みも書きもしない
+    if (!(isCiRunner)) {
+        writeResult "defenderon_$Dataset" ([ordered]@{ Type = "defenderon"; Dataset = $Dataset; Skipped = "CI の実行機ではないので何もしない" })
+        return
+    }
     $before = getDefenderState
     $message = ""
     try {
         Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction Stop
     } catch { $message = $_.Exception.Message }
+    # 作業フォルダを含む除外（実行機の初期設定は D:\ と C:\ を除外している）を外す
+    $target = [System.IO.Path]::GetFullPath($Work).TrimEnd('\')
+    $removed = New-Object System.Collections.ArrayList
+    $removeMessages = New-Object System.Collections.ArrayList
+    if ($before.Contains("ExclusionPath")) {
+        foreach ($exclusion in $before.ExclusionPath) {
+            if (!(testExclusionCovers $exclusion $target)) { continue }
+            try {
+                Remove-MpPreference -ExclusionPath $exclusion -ErrorAction Stop
+                [void]$removed.Add($exclusion)
+            } catch { [void]$removeMessages.Add(("{0}: {1}" -f $exclusion, $_.Exception.Message)) }
+        }
+    }
     Start-Sleep -Seconds 5
     $after = getDefenderState
-    writeResult "defenderon_$Dataset" ([ordered]@{ Type = "defenderon"; Dataset = $Dataset; Before = $before; SetMessage = $message; After = $after })
+    $stillCovered = $false
+    if ($after.Contains("ExclusionPath")) {
+        foreach ($exclusion in $after.ExclusionPath) { if (testExclusionCovers $exclusion $target) { $stillCovered = $true } }
+    }
+    writeResult "defenderon_$Dataset" ([ordered]@{ Type = "defenderon"; Dataset = $Dataset; WorkFolderExcludedAfter = $stillCovered; RemovedExclusions = $removed.ToArray(); RemoveMessages = $removeMessages.ToArray(); Before = $before; SetMessage = $message; After = $after })
 }
 
 # ---------------------------------------------------------------- share（地図で開いている間に、ファイルを入れ替える・消せるか）
@@ -1449,7 +1485,11 @@ function invokeShare {
         if ($folderStillThere) { [void]$flow.Add((tryShareAction "delete_old_folder_after_close" { [System.IO.Directory]::Delete($genFolder) })) }
         $flowSummary = [ordered]@{ ReadableAfterDelete = $stillReadable; EntriesWhileOpen = $remainWhileOpen; EntriesAfterClose = $remainAfterClose; FolderThereAfterClose = $folderStillThere }
     } else { $flowSummary = [ordered]@{ Error = "seg_base が無い" } }
-    writeResult "share_$Dataset" ([ordered]@{ Type = "share"; Dataset = $Dataset; Probes = $probes.ToArray(); Flow = $flow.ToArray(); FlowSummary = $flowSummary })
+    # 削除の動き（開いたままでも名前が消えるか）は OS とファイルシステムに依るので、記録する
+    $fileSystem = ""
+    try { $fileSystem = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($Work))).DriveFormat } catch { $fileSystem = "不明: " + $_.Exception.Message }
+    $environment = [ordered]@{ OSVersion = [Environment]::OSVersion.VersionString; FileSystem = $fileSystem }
+    writeResult "share_$Dataset" ([ordered]@{ Type = "share"; Dataset = $Dataset; Environment = $environment; Probes = $probes.ToArray(); Flow = $flow.ToArray(); FlowSummary = $flowSummary })
 }
 
 # ---------------------------------------------------------------- summary
@@ -1519,9 +1559,13 @@ function invokeSummary {
             "defenderon" {
                 [void]$lines.Add("#### Defender のリアルタイム保護を有効にする試み")
                 [void]$lines.Add("")
-                [void]$lines.Add(("- 前: " + ($result.Before | ConvertTo-Json -Compress)))
-                [void]$lines.Add(("- 設定したときのメッセージ: " + $result.SetMessage))
-                [void]$lines.Add(("- 後: " + ($result.After | ConvertTo-Json -Compress)))
+                if ($null -ne $result.Skipped) { [void]$lines.Add("- " + $result.Skipped) } else {
+                    [void]$lines.Add(("- 前: " + ($result.Before | ConvertTo-Json -Compress)))
+                    [void]$lines.Add(("- 設定したときのメッセージ: " + $result.SetMessage))
+                    [void]$lines.Add(("- 外した除外: " + (@($result.RemovedExclusions) -join "、") + "（外せなかった: " + (@($result.RemoveMessages) -join "、") + "）"))
+                    [void]$lines.Add(("- 作業フォルダが除外に含まれたまま: {0}" -f $result.WorkFolderExcludedAfter))
+                    [void]$lines.Add(("- 後: " + ($result.After | ConvertTo-Json -Compress)))
+                }
                 [void]$lines.Add("")
             }
             "share" {
@@ -1539,6 +1583,7 @@ function invokeSummary {
                     [void]$lines.Add(("| {0} | {1} | {2} | {3} |" -f $step.Name, $step.Succeeded, $step.Ms, $step.Error))
                 }
                 [void]$lines.Add("")
+                [void]$lines.Add(("- 環境: " + ($result.Environment | ConvertTo-Json -Compress)))
                 [void]$lines.Add(("- " + ($result.FlowSummary | ConvertTo-Json -Compress)))
                 [void]$lines.Add("")
             }
@@ -1547,7 +1592,7 @@ function invokeSummary {
                 [void]$lines.Add("")
                 [void]$lines.Add(("- Defender: " + ($result.Status | ConvertTo-Json -Compress)))
                 [void]$lines.Add("")
-                [void]$lines.Add("| ファイル | MB | 書く ms | 1 回目 開く ms | 1 回目 全部読む ms | 2 回目 開く ms | 2 回目 全部読む ms |")
+                [void]$lines.Add("| ファイル | MB | 書く ms | 初めて開く ms | 初めて全部読む ms | 続けて開く ms | 続けてもう一度読む ms |")
                 [void]$lines.Add("|---|---|---|---|---|---|---|")
                 foreach ($file in $result.Files) {
                     [void]$lines.Add(("| {0} | {1} | {2} | {3} | {4} | {5} | {6} |" -f $file.Name, (formatNumber $file.Megabytes), (formatNumber $file.WriteMs), $file.First.FirstOpenMs, $file.First.FirstReadAllMs, $file.First.SecondOpenMs, $file.First.SecondReadAllMs))
