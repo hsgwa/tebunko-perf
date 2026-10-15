@@ -10,7 +10,9 @@
 name: gram
 
 on:
+  # 同じ版が push と pull_request で 2 回動かないよう、push は main だけにする。手で動かすときは workflow_dispatch
   push:
+    branches: [main]
     paths:
       - "tools/measure_gram.ps1"
       - ".github/workflows/gram.yml"
@@ -18,6 +20,7 @@ on:
     paths:
       - "tools/measure_gram.ps1"
       - ".github/workflows/gram.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -67,6 +70,12 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           Write-Host ("data seconds: {0}" -f $watch.Elapsed.TotalSeconds)
 
+      - name: Defender のリアルタイム保護を有効にする（実行機の上だけ。無効にする方向はしない）
+        continue-on-error: true
+        shell: powershell
+        run: |
+          & $env:MEASURE -Stage defenderon -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out")
+
       - name: 2-gram の集合を求める（prep）
         shell: powershell
         run: |
@@ -99,6 +108,19 @@ jobs:
         shell: powershell
         run: |
           & $env:MEASURE -Stage build -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out") -Shape list -Unit blocks
+
+      - name: 表を作る（list / files / 分割 32）
+        id: build_list_files_p32
+        continue-on-error: true
+        shell: powershell
+        run: |
+          & $env:MEASURE -Stage build -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out") -Shape list -Unit files -Parts 32 -Label _p32
+
+      - name: 検索する（list / files / 分割 32）
+        continue-on-error: true
+        shell: powershell
+        run: |
+          & $env:MEASURE -Stage search -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out") -Shape list -Unit files -Label _p32 -Repeat 5
 
       - name: 検索する（list / files）
         continue-on-error: true
@@ -148,6 +170,12 @@ jobs:
         run: |
           & $env:MEASURE -Stage segsearch -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out") -SegmentCount 8 -Repeat 5
 
+      - name: 地図で開いている間の削除・入れ替えを測る（share）
+        continue-on-error: true
+        shell: powershell
+        run: |
+          & $env:MEASURE -Stage share -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out")
+
       - name: 大きいファイルを初めて開く時間を測る（defender）
         continue-on-error: true
         shell: powershell
@@ -174,7 +202,7 @@ jobs:
         shell: powershell
         run: |
           $out = Join-Path $env:RUNNER_TEMP "gram\out"
-          $names = @("prep_$env:DATASET", "build_${env:DATASET}_list_files", "build_${env:DATASET}_bitset_files", "build_${env:DATASET}_mixed_files", "build_${env:DATASET}_list_blocks", "search_${env:DATASET}_list_files", "search_${env:DATASET}_bitset_files", "search_${env:DATASET}_mixed_files", "search_${env:DATASET}_list_blocks", "segbuild_$env:DATASET", "merge_${env:DATASET}_2", "merge_${env:DATASET}_8", "segsearch_$env:DATASET", "defender_$env:DATASET")
+          $names = @("defenderon_$env:DATASET", "prep_$env:DATASET", "build_${env:DATASET}_list_files", "build_${env:DATASET}_list_files_p32", "search_${env:DATASET}_list_files_p32", "share_$env:DATASET","build_${env:DATASET}_bitset_files", "build_${env:DATASET}_mixed_files", "build_${env:DATASET}_list_blocks", "search_${env:DATASET}_list_files", "search_${env:DATASET}_bitset_files", "search_${env:DATASET}_mixed_files", "search_${env:DATASET}_list_blocks", "segbuild_$env:DATASET", "merge_${env:DATASET}_2", "merge_${env:DATASET}_8", "segsearch_$env:DATASET", "defender_$env:DATASET")
           $missing = @($names | Where-Object { !(Test-Path -LiteralPath (Join-Path $out "$_.json")) })
           if ($missing.Count -gt 0) {
             Write-Host ("missing results: " + ($missing -join ", "))

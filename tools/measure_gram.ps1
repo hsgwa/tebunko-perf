@@ -5,19 +5,21 @@
 # Add-Type・P/Invoke・子プロセスは使わない（段階ごとに別のプロセスで動かすのは、呼ぶ側のワークフロー）。
 #
 # 段階（-Stage）:
+#   defenderon リアルタイム保護を有効にする方向に設定を変え、前後の状態を記録する（無効にする方向の変更はしない）
 #   prep      データを作り（または読み）、ファイルごと・ブロックごとの 2-gram の集合を Work\grams に書く。検索語の表も作る
-#   build     -Shape（list / bitset / mixed）と -Unit（files / blocks）の表を作る
-#   search    作った表で語を検索する。FileStream で読む方法と、MemoryMappedFile で読む方法を比べる
-#   segbuild  区画の追加の時間を測る（土台 1 つ + ファイル 1 つの区画 7 つ）
+#   build     -Shape（list / bitset / mixed）と -Unit（files / blocks）の表を作る。-Label で結果の名前に印を付ける（-Parts を変えた作り直しなど）
+#   search    作った表で語を検索する。FileStream で全部読む方法・FileStream の位置指定で二分探索する方法・MemoryMappedFile で読む方法を比べる
+#   segbuild  区画の追加の時間を測る（土台 1 つ + ファイル 1 つの区画 7 つ + 書き直しの区画）
 #   merge     区画をまとめ直す時間と最大メモリを測る（-SegmentCount 2 または 8）
-#   segsearch 区画が 8 つのときと、まとめ直した後の検索を比べる
+#   segsearch 区画が 8 つのときと、まとめ直した後の検索を比べる。書き直したファイルの古い行を無効にする確かめも行う
+#   share     MemoryMappedFile で開いている間の File.Delete / File.Move / File.Replace の成否と、世代の入れ替えの流れを測る
 #   defender  大きいファイルを初めて開く時間と 2 回目の時間を測る
 #   summary   Out の結果を Markdown にまとめる
 #
 # -Dataset perfdata は、tebunko-perfdata の new_index.ps1 が作ったフォルダ（-Index）の 部署N\年度M を本文インデックス 1 ファイルとみなす。
 # -Dataset zipf は、語の出方に偏りを付けた乱数の文章（出現の多い語と、ファイルごとにほぼ 1 回しか出ない語）を作る。
 param (
-    [Parameter(Mandatory = $true)][ValidateSet("prep", "build", "search", "segbuild", "merge", "segsearch", "defender", "summary")][string]$Stage,
+    [Parameter(Mandatory = $true)][ValidateSet("defenderon", "prep", "build", "search", "segbuild", "merge", "segsearch", "share", "defender", "summary")][string]$Stage,
     [ValidateSet("perfdata", "zipf")][string]$Dataset = "zipf",
     [Parameter(Mandatory = $true)][string]$Work,
     [Parameter(Mandatory = $true)][string]$Out,
@@ -29,7 +31,8 @@ param (
     [int]$Workers = 4,
     [int]$BlockChars = 65536,
     [int]$SegmentCount = 8,
-    [int]$Repeat = 5
+    [int]$Repeat = 5,
+    [string]$Label = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,7 +41,7 @@ $ErrorActionPreference = "Stop"
 $Work = (Resolve-Path -LiteralPath $Work).ProviderPath.TrimEnd("\")
 $Out = (Resolve-Path -LiteralPath $Out).ProviderPath.TrimEnd("\")
 $gramFolder = Join-Path $Work "grams"
-$shapeFolder = Join-Path $Work "shape_${Shape}_${Unit}"
+$shapeFolder = Join-Path $Work "shape_${Shape}_${Unit}$Label"
 $culture = [System.Globalization.CultureInfo]::InvariantCulture
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $bitMasks = [byte[]](1, 2, 4, 8, 16, 32, 64, 128)
@@ -231,6 +234,8 @@ $workerScript = {
     }
 
     # ブロック（blockChars 文字。隣のブロックとの境目の 2 文字を落とさないよう、1 文字重ねる）ごとの集合と、その和（ファイルの集合）
+    # 重ねは 1 文字なので、境目をまたぐ 3 文字以上の語は、1 つのブロックがその語の gram を全部は持たず、ブロック単位では漏れうる（ファイル単位では漏れない）。
+    # 測った「漏れ」の数は、その語が見本に無かっただけで、漏れないことの証明ではない。
     $fileSet = New-Object 'System.Collections.Generic.HashSet[uint32]'
     $blockStream = New-Object System.IO.MemoryStream
     $writer = New-Object System.IO.BinaryWriter $blockStream
@@ -265,13 +270,22 @@ $workerScript = {
         $candidate = $text.Substring($sampleRandom.Next($text.Length - 3), 3)
         if ($candidate -match '^[^\s "\\]{3}$') { $samples.Add($candidate) }
     }
+    # まれな語の見本（zipf のみ）: ファイルごとに 1 回しか出ない乱数の漢字の並び（末尾の 50000 文字のうち前半の 30000 文字）から、3 文字と 4 文字を取る
+    $rareSamples = New-Object 'System.Collections.Generic.List[string]'
+    if ($dataset -eq "zipf" -and $unitIndex -lt 6) {
+        $rareStart = $text.Length - 50000
+        $rareRandom = [System.Random]::new($seed * 104729 + $unitIndex)
+        $rareSamples.Add($text.Substring($rareStart + $rareRandom.Next(29000), 3))
+        $rareSamples.Add($text.Substring($rareStart + $rareRandom.Next(29000), 4))
+    }
     return [pscustomobject]@{
-        UnitIndex = $unitIndex
-        Chars     = $text.Length
-        Distinct  = $fileValues.Length
-        Blocks    = $blockSizes.ToArray()
-        Samples   = $samples.ToArray()
-        Seconds   = $timer.Elapsed.TotalSeconds
+        UnitIndex   = $unitIndex
+        Chars       = $text.Length
+        Distinct    = $fileValues.Length
+        Blocks      = $blockSizes.ToArray()
+        Samples     = $samples.ToArray()
+        RareSamples = $rareSamples.ToArray()
+        Seconds     = $timer.Elapsed.TotalSeconds
     }
 }
 
@@ -355,18 +369,25 @@ function invokePrep {
     $blockCounts = New-Object 'System.Collections.Generic.List[int]'
     $blockSizes = New-Object 'System.Collections.Generic.List[double]'
     $samples = New-Object 'System.Collections.Generic.List[string]'
+    $rareCandidates = New-Object 'System.Collections.Generic.List[string]'
     foreach ($result in $results) {
         $chars += $result.Chars
         $blockCounts.Add(@($result.Blocks).Count)
         foreach ($size in @($result.Blocks)) { $blockSizes.Add($size) }
         foreach ($sample in @($result.Samples)) { $samples.Add($sample) }
+        foreach ($sample in @($result.RareSamples)) { $rareCandidates.Add($sample) }
     }
 
-    # 検索語: 該当無し・まれ（perfdata の見積書）・見本の 3 文字・見本の先頭 2 文字
+    # 検索語: 該当無し・まれ・見本の 3 文字・見本の先頭 2 文字
+    # まれな語は、perfdata では見積書。zipf では、ファイルごとに 1 回しか出ない乱数の漢字の並びから取った語のうち、含むファイルが 1〜3 個のもの（下で真の数を数えてから絞る）
     $random = [System.Random]::new(5)
     $words = New-Object System.Collections.ArrayList
     [void]$words.Add([pscustomobject]@{ Word = "該当無し"; Kind = "zero" })
-    [void]$words.Add([pscustomobject]@{ Word = "見積書"; Kind = "rare" })
+    if ($Dataset -eq "perfdata") {
+        [void]$words.Add([pscustomobject]@{ Word = "見積書"; Kind = "rare" })
+    } else {
+        foreach ($rare in $rareCandidates) { [void]$words.Add([pscustomobject]@{ Word = $rare; Kind = "rare" }) }
+    }
     $shuffled = @($samples | Sort-Object { $random.Next() } | Select-Object -Unique)
     foreach ($sample in ($shuffled | Select-Object -First 40)) { [void]$words.Add([pscustomobject]@{ Word = $sample; Kind = "sample3" }) }
     foreach ($sample in ($shuffled | Select-Object -Skip 40 -First 10)) { [void]$words.Add([pscustomobject]@{ Word = $sample.Substring(0, 2); Kind = "sample2" }) }
@@ -388,6 +409,7 @@ function invokePrep {
     $queries = New-Object System.Collections.ArrayList
     for ($wordIndex = 0; $wordIndex -lt $words.Count; $wordIndex++) {
         $files = if ($trueFiles.ContainsKey($wordIndex)) { $trueFiles[$wordIndex].ToArray() } else { @() }
+        if ($Dataset -eq "zipf" -and $words[$wordIndex].Kind -eq "rare" -and (@($files).Count -lt 1 -or @($files).Count -gt 3)) { continue }
         [void]$queries.Add([pscustomobject]@{ Word = $words[$wordIndex].Word; Kind = $words[$wordIndex].Kind; TrueFiles = @($files) })
     }
     [System.IO.File]::WriteAllText((Join-Path $Work "queries.json"), (ConvertTo-Json -InputObject @($queries) -Depth 4), $utf8NoBom)
@@ -686,9 +708,14 @@ function invokeBuild {
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
     $loaded = loadUnitGrams $Unit
     $loadSeconds = $timer.Elapsed.TotalSeconds
+    # 最大メモリの中身を見るための途中の値（GC をかけたあとの、管理されたメモリの大きさ）。全ファイルの gram の配列がどれだけを占めるか
+    $managedAfterLoad = [Math]::Round([GC]::GetTotalMemory($true) / 1MB)
+    $peakAfterLoad = getPeakMegabytes
     $timer.Restart()
     $dict = newGramDictionary $loaded.Grams
     $dictSeconds = $timer.Elapsed.TotalSeconds
+    $peakAfterDictionary = getPeakMegabytes
+    $managedAfterDictionary = [Math]::Round([GC]::GetTotalMemory($true) / 1MB)
     $unitIds = [int[]](0..($loaded.Grams.Count - 1))
     $gather = newGramGather $loaded.Grams $unitIds
     $metrics = buildParts $dict $Parts $loaded.Grams.Count $loaded.Grams.Count $Shape $shapeFolder $gather
@@ -702,12 +729,17 @@ function invokeBuild {
     $metrics.Dataset = $Dataset
     $metrics.Shape = $Shape
     $metrics.Unit = $Unit
+    $metrics.Label = $Label
     $metrics.Units = $loaded.Grams.Count
+    $metrics.ManagedMegabytesAfterLoad = $managedAfterLoad
+    $metrics.PeakMegabytesAfterLoad = $peakAfterLoad
+    $metrics.ManagedMegabytesAfterDictionary = $managedAfterDictionary
+    $metrics.PeakMegabytesAfterDictionary = $peakAfterDictionary
     $metrics.LoadSeconds = [Math]::Round($loadSeconds, 1)
     $metrics.DictSeconds = [Math]::Round($dictSeconds, 1)
     $metrics.TotalSeconds = [Math]::Round($totalTimer.Elapsed.TotalSeconds, 1)
     $metrics.PeakMegabytes = getPeakMegabytes
-    writeResult "build_${Dataset}_${Shape}_${Unit}" $metrics
+    writeResult "build_${Dataset}_${Shape}_${Unit}$Label" $metrics
 }
 
 # ---------------------------------------------------------------- search（表を引く）
@@ -736,6 +768,47 @@ function searchListFs {
         $counts = New-Object byte[] $unitTotal
         foreach ($gram in $gramValues) {
             $found = [Array]::BinarySearch($dict, $gram)
+            if ($found -lt 0) { return , ([int[]]@()) }
+            $range = readUInt32Array $offsetStream ([long]$found * 4) 2
+            $items = readUInt16Array $listStream ([long]$range[0] * 2) ([int]($range[1] - $range[0]))
+            addUnitsToCounts $counts $items
+        }
+        return , (getCandidates $counts $gramValues.Length)
+    } finally {
+        $dictStream.Dispose(); $offsetStream.Dispose(); $listStream.Dispose()
+    }
+}
+
+function readUInt32At {
+    param ($stream, [long]$position, $buffer)
+    [void]$stream.Seek($position, [System.IO.SeekOrigin]::Begin)
+    $done = 0
+    while ($done -lt 4) {
+        $read = $stream.Read($buffer, $done, 4 - $done)
+        if ($read -le 0) { throw "ファイルが途中で終わっています" }
+        $done += $read
+    }
+    return [System.BitConverter]::ToUInt32($buffer, 0)
+}
+
+function searchListFsSeek {
+    # FileStream で、辞書を丸ごと読まずに、位置を指定して二分探索する（1 回の探索で 4 バイトの読み込みを約 24 回）
+    param ([string]$folder, $gramValues, [int]$unitTotal)
+    $dictStream = openShared (Join-Path $folder "dict.bin")
+    $offsetStream = openShared (Join-Path $folder "offs.bin")
+    $listStream = openShared (Join-Path $folder "lists.bin")
+    try {
+        $dictCount = [long]($dictStream.Length / 4)
+        $buffer = New-Object byte[] 4
+        $counts = New-Object byte[] $unitTotal
+        foreach ($gram in $gramValues) {
+            $lowIndex = [long]0; $highIndex = $dictCount - 1; $found = -1
+            while ($lowIndex -le $highIndex) {
+                $middle = [long][Math]::Floor(($lowIndex + $highIndex) / 2)
+                $value = readUInt32At $dictStream ($middle * 4) $buffer
+                if ($value -eq $gram) { $found = $middle; break }
+                if ($value -lt $gram) { $lowIndex = $middle + 1 } else { $highIndex = $middle - 1 }
+            }
             if ($found -lt 0) { return , ([int[]]@()) }
             $range = readUInt32Array $offsetStream ([long]$found * 4) 2
             $items = readUInt16Array $listStream ([long]$range[0] * 2) ([int]($range[1] - $range[0]))
@@ -894,17 +967,18 @@ function summarizeQueryRows {
 }
 
 function invokeSearch {
-    $buildResult = readResult "build_${Dataset}_${Shape}_${Unit}"
+    $buildResult = readResult "build_${Dataset}_${Shape}_${Unit}$Label"
     $queries = getSearchQueries $buildResult
     $unitFile = readWholeUInt16 (Join-Path $shapeFolder "unitfile.bin")
     $unitTotal = $unitFile.Length
     $methods = @("fs")
-    if ($Shape -eq "list") { $methods += "mmf" }
+    if ($Shape -eq "list") { $methods += "fsseek"; $methods += "mmf" }
     $results = [ordered]@{}
     foreach ($method in $methods) {
         $folder = $shapeFolder
         $invoke = switch ("${Shape}_${method}") {
             "list_fs" { $search = ${function:searchListFs}; { param ($grams) & $search $folder $grams $unitTotal }.GetNewClosure() }
+            "list_fsseek" { $search = ${function:searchListFsSeek}; { param ($grams) & $search $folder $grams $unitTotal }.GetNewClosure() }
             "list_mmf" { $search = ${function:searchListMmf}; { param ($grams) & $search $folder $grams $unitTotal }.GetNewClosure() }
             "bitset_fs" { $search = ${function:searchBitsetFs}; { param ($grams) & $search $folder $grams $unitTotal }.GetNewClosure() }
             "mixed_fs" { $search = ${function:searchMixedFs}; { param ($grams) & $search $folder $grams $unitTotal }.GetNewClosure() }
@@ -912,7 +986,7 @@ function invokeSearch {
         $measured = measureQueries $queries $invoke $(if ($Unit -eq "blocks") { $unitFile } else { $null })
         $results[$method] = [ordered]@{ ProcessFirstMs = $measured.ProcessFirstMs; ByKind = summarizeQueryRows $measured.Rows }
     }
-    writeResult "search_${Dataset}_${Shape}_${Unit}" ([ordered]@{ Type = "search"; Dataset = $Dataset; Shape = $Shape; Unit = $Unit; Methods = $results; PeakMegabytes = getPeakMegabytes })
+    writeResult "search_${Dataset}_${Shape}_${Unit}$Label" ([ordered]@{ Type = "search"; Dataset = $Dataset; Shape = $Shape; Unit = $Unit; Methods = $results; PeakMegabytes = getPeakMegabytes })
 }
 
 # ---------------------------------------------------------------- 区画（segment）と、まとめ直し
@@ -951,11 +1025,27 @@ function invokeSegmentBuild {
     [void](buildParts $sliceDict 1 $total $total "list" (Join-Path $Work "seg_book") (newGramGather $sliceList @(($total - 1))))
     $bookSeconds = $timer.Elapsed.TotalSeconds
 
+    # 書き直しの区画: 0 番のファイルを書き直したとして、元の gram の前半を無くし、新しい gram（私用領域の文字の 2 文字の組 1000 個）を足した区画
+    $timer.Restart()
+    $original = $loaded.Grams[0]
+    $half = [int]($original.Length / 2)
+    $rewritten = New-Object 'uint32[]' ($original.Length - $half + 1000)
+    [System.Buffer]::BlockCopy($original, $half * 4, $rewritten, 0, ($original.Length - $half) * 4)
+    for ($newIndex = 0; $newIndex -lt 1000; $newIndex++) {
+        $rewritten[$original.Length - $half + $newIndex] = [uint32](0xE000 + $newIndex) + 65536 * [uint32](0xE000 + $newIndex + 1)
+    }
+    $rewriteList = New-Object 'System.Collections.Generic.List[uint32[]]'
+    $rewriteList.Add($rewritten)
+    $rewriteDict = newGramDictionary $rewriteList
+    [void](buildParts $rewriteDict 1 $total $total "list" (Join-Path $Work "seg_rewrite") (newGramGather $rewriteList @(0)))
+    $rewriteSeconds = $timer.Elapsed.TotalSeconds
+
     writeResult "segbuild_$Dataset" ([ordered]@{
             Type = "segbuild"; Dataset = $Dataset; Units = $total; SegmentUnits = $segmentUnits
             BaseSeconds = [Math]::Round($baseSeconds, 1)
             OneFileSegmentSeconds = getStats $segmentSeconds
             OneBookSegmentSeconds = [Math]::Round($bookSeconds, 2); OneBookGrams = $slice.Length
+            RewriteSegmentSeconds = [Math]::Round($rewriteSeconds, 2); RewriteGrams = $rewritten.Length
             PeakMegabytes = getPeakMegabytes
         })
 }
@@ -1035,6 +1125,82 @@ function invokeMerge {
     writeResult "merge_${Dataset}_$SegmentCount" $metrics
 }
 
+function toIntList {
+    param ($candidates)
+    $list = New-Object 'System.Collections.Generic.List[int]'
+    foreach ($candidate in $candidates) { $list.Add([int]$candidate) }
+    return , $list
+}
+
+function invokeRewriteCheck {
+    # 0 番のファイルを書き直した区画（seg_rewrite。元の gram の前半を無くし、新しい gram を足した）を一番新しい区画として足したときの、候補を確かめる。
+    # 古い区画の 0 番のファイルの行を、新しい区画があるために無効にする規則（newest）と、無効にしない場合（naive）を比べる。
+    param ($segmentFolders, [int]$total, [string]$wholeFolder)
+    $rewriteFolder = Join-Path $Work "seg_rewrite"
+    if (![System.IO.Directory]::Exists($rewriteFolder)) { return $null }
+    $segmentUnits = [Math]::Min(7, $total - 1)
+    $folders = New-Object 'System.Collections.Generic.List[string]'
+    $covered = New-Object System.Collections.ArrayList
+    $baseCovered = New-Object 'System.Collections.Generic.HashSet[int]'
+    for ($unitIndex = 0; $unitIndex -lt $total - $segmentUnits; $unitIndex++) { [void]$baseCovered.Add($unitIndex) }
+    $folders.Add($segmentFolders[0]); [void]$covered.Add($baseCovered)
+    for ($segmentIndex = 1; $segmentIndex -le $segmentUnits; $segmentIndex++) {
+        $folder = Join-Path $Work "seg_$segmentIndex"
+        if (![System.IO.Directory]::Exists($folder)) { continue }
+        $single = New-Object 'System.Collections.Generic.HashSet[int]'
+        [void]$single.Add($total - $segmentUnits + $segmentIndex - 1)
+        $folders.Add($folder); [void]$covered.Add($single)
+    }
+    $rewriteCovered = New-Object 'System.Collections.Generic.HashSet[int]'
+    [void]$rewriteCovered.Add(0)
+    $folders.Add($rewriteFolder); [void]$covered.Add($rewriteCovered)
+
+    # 書き直す前に 0 番のファイルだけにあった gram（前半）を 2 文字の語にする
+    $originalGrams = readWholeUInt32 (Join-Path $gramFolder "files_0.u32")
+    $oldWords = New-Object System.Collections.ArrayList
+    $searchMmf = ${function:searchListMmf}
+    $searchList = ${function:searchListFs}
+    $step = [Math]::Max(1, [int]($originalGrams.Length / 2 / 3000))
+    for ($index = 0; $index -lt [int]($originalGrams.Length / 2) -and $oldWords.Count -lt 10; $index += $step) {
+        $word = convertGramToText $originalGrams[$index]
+        $roundTrip = getSearchGramValues $word
+        if ($roundTrip.Length -ne 1 -or $roundTrip[0] -ne $originalGrams[$index]) { continue }
+        $whole = toIntList (& $searchMmf $wholeFolder $roundTrip $total)
+        if ($whole.Count -eq 1 -and $whole[0] -eq 0) { [void]$oldWords.Add($word) }
+    }
+    $newWords = New-Object System.Collections.ArrayList
+    for ($newIndex = 0; $newIndex -lt 1000 -and $newWords.Count -lt 10; $newIndex += 100) {
+        [void]$newWords.Add(([string][char](0xE000 + $newIndex)) + [char](0xE000 + $newIndex + 1) + [char](0xE000 + $newIndex + 2))
+    }
+
+    $result = [ordered]@{ OldWordCount = $oldWords.Count; NewWordCount = $newWords.Count; OldStaleNaive = 0; OldStaleNewest = 0; NewFoundNaive = 0; NewFoundNewest = 0 }
+    foreach ($entry in @(@("old", $oldWords), @("new", $newWords))) {
+        foreach ($word in $entry[1]) {
+            $grams = getSearchGramValues $word
+            $perFolder = New-Object System.Collections.ArrayList
+            foreach ($folder in $folders) { [void]$perFolder.Add((toIntList (& $searchList $folder $grams $total))) }
+            $naive = New-Object 'System.Collections.Generic.HashSet[int]'
+            $newest = New-Object 'System.Collections.Generic.HashSet[int]'
+            for ($folderIndex = 0; $folderIndex -lt $folders.Count; $folderIndex++) {
+                foreach ($candidate in $perFolder[$folderIndex]) {
+                    [void]$naive.Add([int]$candidate)
+                    $replaced = $false
+                    for ($laterIndex = $folderIndex + 1; $laterIndex -lt $folders.Count; $laterIndex++) { if ($covered[$laterIndex].Contains([int]$candidate)) { $replaced = $true; break } }
+                    if (!$replaced) { [void]$newest.Add([int]$candidate) }
+                }
+            }
+            if ($entry[0] -eq "old") {
+                if ($naive.Contains(0)) { $result.OldStaleNaive++ }
+                if ($newest.Contains(0)) { $result.OldStaleNewest++ }
+            } else {
+                if ($naive.Contains(0)) { $result.NewFoundNaive++ }
+                if ($newest.Contains(0)) { $result.NewFoundNewest++ }
+            }
+        }
+    }
+    return $result
+}
+
 function invokeSegmentSearch {
     $buildResult = readResult "build_${Dataset}_list_files"
     $queries = getSearchQueries $buildResult
@@ -1054,10 +1220,18 @@ function invokeSegmentSearch {
         foreach ($folder in $segmentFolders) { foreach ($candidate in (& $searchList $folder $grams $total)) { [void]$union.Add($candidate) } }
         return , ([int[]]@($union))
     }.GetNewClosure()
+    $searchMmf = ${function:searchListMmf}
+    $invokeSegmentsMmf = {
+        param ($grams)
+        $union = New-Object 'System.Collections.Generic.SortedSet[int]'
+        foreach ($folder in $segmentFolders) { foreach ($candidate in (& $searchMmf $folder $grams $total)) { [void]$union.Add($candidate) } }
+        return , ([int[]]@($union))
+    }.GetNewClosure()
     $invokeMerged = { param ($grams) & $searchList $mergedFolder $grams $total }.GetNewClosure()
+    $invokeMergedMmf = { param ($grams) & $searchMmf $mergedFolder $grams $total }.GetNewClosure()
     $invokeWhole = { param ($grams) & $searchList $wholeFolder $grams $total }.GetNewClosure()
     $results = [ordered]@{}
-    foreach ($entry in @(@("whole", $invokeWhole), @("segments", $invokeSegments), @("merged", $invokeMerged))) {
+    foreach ($entry in @(@("whole", $invokeWhole), @("segments", $invokeSegments), @("merged", $invokeMerged), @("segments_mmf", $invokeSegmentsMmf), @("merged_mmf", $invokeMergedMmf))) {
         $measured = measureQueries $queries $entry[1] $null
         $results[$entry[0]] = [ordered]@{ ProcessFirstMs = $measured.ProcessFirstMs; ByKind = summarizeQueryRows $measured.Rows }
     }
@@ -1069,7 +1243,8 @@ function invokeSegmentSearch {
         $a = @(& $invokeSegments $grams); $b = @(& $invokeMerged $grams); $c = @(& $invokeWhole $grams)
         if (($a -join ",") -ne ($b -join ",") -or ($b -join ",") -ne ($c -join ",")) { $different++ }
     }
-    writeResult "segsearch_${Dataset}" ([ordered]@{ Type = "segsearch"; Dataset = $Dataset; Segments = $segmentFolders.Count; DifferentCandidates = $different; Methods = $results; PeakMegabytes = getPeakMegabytes })
+    $rewriteCheck = invokeRewriteCheck $segmentFolders $total $wholeFolder
+    writeResult "segsearch_${Dataset}" ([ordered]@{ Type = "segsearch"; Dataset = $Dataset; Segments = $segmentFolders.Count; DifferentCandidates = $different; RewriteCheck = $rewriteCheck; Methods = $results; PeakMegabytes = getPeakMegabytes })
 }
 
 # ---------------------------------------------------------------- defender
@@ -1122,6 +1297,159 @@ function invokeDefender {
     writeResult "defender_$Dataset" ([ordered]@{ Type = "defender"; Dataset = $Dataset; Status = $status; Files = $files.ToArray() })
 }
 
+# ---------------------------------------------------------------- defenderon（リアルタイム保護を有効にする試み）
+
+function getDefenderState {
+    try {
+        $computer = Get-MpComputerStatus
+        $preference = Get-MpPreference
+        return [ordered]@{
+            RealTimeProtectionEnabled = $computer.RealTimeProtectionEnabled
+            AMServiceEnabled          = $computer.AMServiceEnabled
+            AntivirusEnabled          = $computer.AntivirusEnabled
+            DisableRealtimeMonitoring = $preference.DisableRealtimeMonitoring
+        }
+    } catch { return [ordered]@{ Error = $_.Exception.Message } }
+}
+
+function invokeDefenderOn {
+    # CI の実行機の上だけで、リアルタイム保護を有効にする方向に変える。無効にする方向の変更はしない
+    $before = getDefenderState
+    $message = ""
+    try {
+        Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction Stop
+    } catch { $message = $_.Exception.Message }
+    Start-Sleep -Seconds 5
+    $after = getDefenderState
+    writeResult "defenderon_$Dataset" ([ordered]@{ Type = "defenderon"; Dataset = $Dataset; Before = $before; SetMessage = $message; After = $after })
+}
+
+# ---------------------------------------------------------------- share（地図で開いている間に、ファイルを入れ替える・消せるか）
+
+function tryShareAction {
+    param ([string]$name, [scriptblock]$action)
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    $message = ""
+    $succeeded = $true
+    try { & $action } catch { $succeeded = $false; $message = $_.Exception.Message }
+    return [ordered]@{ Name = $name; Succeeded = $succeeded; Ms = [Math]::Round($timer.Elapsed.TotalMilliseconds, 1); Error = $message }
+}
+
+function openMapped {
+    param ([string]$path, [bool]$withMap, $share)
+    $handle = @{ Stream = [System.IO.FileStream]::new($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share); Mapping = $null; View = $null }
+    if ($withMap) {
+        $handle.Mapping = [System.IO.MemoryMappedFiles.MemoryMappedFile]::CreateFromFile($handle.Stream, [NullString]::Value, 0, [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read, [System.IO.HandleInheritability]::None, $true)
+        $handle.View = $handle.Mapping.CreateViewAccessor(0, 0, [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read)
+    }
+    return $handle
+}
+
+function closeMapped {
+    param ($handle)
+    if ($null -ne $handle.View) { $handle.View.Dispose() }
+    if ($null -ne $handle.Mapping) { $handle.Mapping.Dispose() }
+    $handle.Stream.Dispose()
+}
+
+function newProbeFile {
+    param ([string]$path)
+    $bytes = New-Object byte[] (8MB)
+    [System.IO.File]::WriteAllBytes($path, $bytes)
+}
+
+function invokeShare {
+    $probeFolder = Join-Path $Work "share_probe"
+    [void][System.IO.Directory]::CreateDirectory($probeFolder)
+    $shareAll = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+    $probes = New-Object System.Collections.ArrayList
+
+    # (a) 8MB の試験ファイルで、開き方ごとの成否を見る
+    $cases = @(
+        @{ Name = "map_open_delete"; Map = $true; Share = $shareAll; Kind = "delete" },
+        @{ Name = "map_open_move"; Map = $true; Share = $shareAll; Kind = "move" },
+        @{ Name = "map_open_replace"; Map = $true; Share = $shareAll; Kind = "replace" },
+        @{ Name = "stream_only_delete"; Map = $false; Share = $shareAll; Kind = "delete" },
+        @{ Name = "stream_only_replace"; Map = $false; Share = $shareAll; Kind = "replace" },
+        @{ Name = "map_share_read_delete"; Map = $true; Share = [System.IO.FileShare]::Read; Kind = "delete" },
+        @{ Name = "map_share_readwrite_delete"; Map = $true; Share = [System.IO.FileShare]::ReadWrite; Kind = "delete" }
+    )
+    foreach ($case in $cases) {
+        $path = Join-Path $probeFolder ($case.Name + ".bin")
+        $other = Join-Path $probeFolder ($case.Name + "_new.bin")
+        newProbeFile $path
+        if ($case.Kind -eq "replace") { newProbeFile $other }
+        $handle = openMapped $path $case.Map $case.Share
+        try {
+            $kind = $case.Kind
+            $moved = Join-Path $probeFolder ($case.Name + "_moved.bin")
+            $row = tryShareAction $case.Name {
+                if ($kind -eq "delete") { [System.IO.File]::Delete($path) }
+                elseif ($kind -eq "move") { [System.IO.File]::Move($path, $moved) }
+                else { [void][System.IO.File]::Replace($other, $path, $null) }
+            }
+            $readable = $true
+            try {
+                if ($null -ne $handle.View) { [void]$handle.View.ReadByte(0) } else { [void]$handle.Stream.Seek(0, [System.IO.SeekOrigin]::Begin); [void]$handle.Stream.ReadByte() }
+            } catch { $readable = $false }
+            $row["ReadableAfter"] = $readable
+            [void]$probes.Add($row)
+        } finally { closeMapped $handle }
+    }
+    # 開いていないファイル（目次の入れ替え）と、閉じた後の削除
+    $indexPath = Join-Path $probeFolder "manifest.txt"
+    $indexNew = Join-Path $probeFolder "manifest.new"
+    [System.IO.File]::WriteAllText($indexPath, "gen1", $utf8NoBom)
+    [System.IO.File]::WriteAllText($indexNew, "gen2", $utf8NoBom)
+    [void]$probes.Add((tryShareAction "manifest_replace" { [void][System.IO.File]::Replace($indexNew, $indexPath, $null) }))
+    $closedPath = Join-Path $probeFolder "closed.bin"
+    newProbeFile $closedPath
+    $closedHandle = openMapped $closedPath $true $shareAll
+    closeMapped $closedHandle
+    [void]$probes.Add((tryShareAction "delete_after_close" { [System.IO.File]::Delete($closedPath) }))
+
+    # (b) 実際の区画を地図で開いたまま、次の世代を書いて目次を替え、古い世代を消す
+    $genFolder = Join-Path $Work "share_gen1"
+    $nextFolder = Join-Path $Work "share_gen2"
+    $sourceFolder = Join-Path $Work "seg_base"
+    $names = @("dict.bin", "offs.bin", "lists.bin")
+    $flow = New-Object System.Collections.ArrayList
+    if ([System.IO.Directory]::Exists($sourceFolder)) {
+        [void][System.IO.Directory]::CreateDirectory($genFolder)
+        foreach ($name in $names) { [System.IO.File]::Copy((Join-Path $sourceFolder $name), (Join-Path $genFolder $name), $true) }
+        $handles = @{}
+        foreach ($name in $names) { $handles[$name] = openMapped (Join-Path $genFolder $name) $true $shareAll }
+        try {
+            # 次の世代を書く（1 ファイルの区画と同じ大きさを、開いたまま書く）
+            $nextSource = Join-Path $Work "seg_1"
+            if (![System.IO.Directory]::Exists($nextSource)) { $nextSource = $sourceFolder }
+            [void]$flow.Add((tryShareAction "write_next_generation" {
+                        [void][System.IO.Directory]::CreateDirectory($nextFolder)
+                        foreach ($name in $names) { [System.IO.File]::Copy((Join-Path $nextSource $name), (Join-Path $nextFolder $name), $true) }
+                    }))
+            $manifest = Join-Path $Work "share_manifest.txt"
+            $manifestNew = Join-Path $Work "share_manifest.new"
+            [System.IO.File]::WriteAllText($manifest, "gen1", $utf8NoBom)
+            [System.IO.File]::WriteAllText($manifestNew, "gen2", $utf8NoBom)
+            [void]$flow.Add((tryShareAction "swap_manifest" { [void][System.IO.File]::Replace($manifestNew, $manifest, $null) }))
+            # 古い世代を、開いたまま消す
+            foreach ($name in $names) {
+                $target = Join-Path $genFolder $name
+                [void]$flow.Add((tryShareAction "delete_old_$name" { [System.IO.File]::Delete($target) }))
+            }
+            [void]$flow.Add((tryShareAction "delete_old_folder" { [System.IO.Directory]::Delete($genFolder) }))
+            $stillReadable = $true
+            try { [void]$handles["dict.bin"].View.ReadUInt32(0) } catch { $stillReadable = $false }
+            $remainWhileOpen = @([System.IO.Directory]::GetFileSystemEntries($genFolder)).Count
+        } finally { foreach ($name in $names) { closeMapped $handles[$name] } }
+        $remainAfterClose = if ([System.IO.Directory]::Exists($genFolder)) { @([System.IO.Directory]::GetFileSystemEntries($genFolder)).Count } else { 0 }
+        $folderStillThere = [System.IO.Directory]::Exists($genFolder)
+        if ($folderStillThere) { [void]$flow.Add((tryShareAction "delete_old_folder_after_close" { [System.IO.Directory]::Delete($genFolder) })) }
+        $flowSummary = [ordered]@{ ReadableAfterDelete = $stillReadable; EntriesWhileOpen = $remainWhileOpen; EntriesAfterClose = $remainAfterClose; FolderThereAfterClose = $folderStillThere }
+    } else { $flowSummary = [ordered]@{ Error = "seg_base が無い" } }
+    writeResult "share_$Dataset" ([ordered]@{ Type = "share"; Dataset = $Dataset; Probes = $probes.ToArray(); Flow = $flow.ToArray(); FlowSummary = $flowSummary })
+}
+
 # ---------------------------------------------------------------- summary
 
 function formatNumber {
@@ -1151,13 +1479,18 @@ function invokeSummary {
                 [void]$lines.Add(("- 単位 {0}、異なる gram {1}、行 {2}（重いgram {3}）、分割 {4}" -f $result.Units, (formatNumber $result.Grams), (formatNumber $result.Rows), (formatNumber $result.HeavyGrams), $result.Parts))
                 [void]$lines.Add(("- 大きさ {0} MB（{1}）" -f (formatNumber ($result.TotalBytes / 1MB)), (($result.Sizes.PSObject.Properties | ForEach-Object { "{0}={1}MB" -f $_.Name, (formatNumber ($_.Value / 1MB)) }) -join "、")))
                 [void]$lines.Add(("- 時間 {0} 秒（読み込み {1}・辞書 {2}・集める {3}・並べ替え {4}・まとめる {5}・形にする {6}・書く {7}）、最大メモリ {8} MB" -f $result.TotalSeconds, $result.LoadSeconds, $result.DictSeconds, $result.GatherSeconds, $result.SortSeconds, $result.GroupSeconds, $result.ShapeSeconds, $result.WriteSeconds, $result.PeakMegabytes))
+                if ($null -ne $result.ManagedMegabytesAfterLoad) { [void]$lines.Add(("- 途中のメモリ MB（管理側／最大）: 読み込み後 {0}／{1}、辞書の後 {2}／{3}" -f $result.ManagedMegabytesAfterLoad, $result.PeakMegabytesAfterLoad, $result.ManagedMegabytesAfterDictionary, $result.PeakMegabytesAfterDictionary)) }
                 [void]$lines.Add(("- gram が出るファイル数の分布: " + (($result.Histogram.PSObject.Properties | ForEach-Object { "{0}={1}" -f $_.Name, (formatNumber $_.Value) }) -join "、")))
                 [void]$lines.Add("")
             }
             { $_ -in @("search", "segsearch") } {
                 [void]$lines.Add(("#### 検索: {0}" -f $name))
                 [void]$lines.Add("")
-                if ($result.Type -eq "segsearch") { [void]$lines.Add(("区画 {0} 個。候補が食い違った語: {1}" -f $result.Segments, $result.DifferentCandidates)); [void]$lines.Add("") }
+                if ($result.Type -eq "segsearch") {
+                    [void]$lines.Add(("区画 {0} 個。候補が食い違った語: {1}" -f $result.Segments, $result.DifferentCandidates))
+                    if ($null -ne $result.RewriteCheck) { [void]$lines.Add(("書き直しの確かめ: " + ($result.RewriteCheck | ConvertTo-Json -Compress -Depth 4))) }
+                    [void]$lines.Add("")
+                }
                 [void]$lines.Add("| 方法 | 種類 | 語数 | 候補ファイル(中央) | 真のファイル(中央) | 漏れ | 中央値 ms(語の中央) | 最大 ms | 最初の1回 ms(最大) |")
                 [void]$lines.Add("|---|---|---|---|---|---|---|---|---|")
                 foreach ($method in $result.Methods.PSObject.Properties) {
@@ -1172,12 +1505,39 @@ function invokeSummary {
                 [void]$lines.Add("#### 区画の追加")
                 [void]$lines.Add("")
                 [void]$lines.Add(("- 土台（{0} 単位）{1} 秒。1 ファイルの区画 中央 {2} 秒（最大 {3}）。1 ブック分（{4} gram）の区画 {5} 秒。最大メモリ {6} MB" -f ($result.Units - $result.SegmentUnits), $result.BaseSeconds, $result.OneFileSegmentSeconds.Median, $result.OneFileSegmentSeconds.Max, (formatNumber $result.OneBookGrams), $result.OneBookSegmentSeconds, $result.PeakMegabytes))
+                if ($null -ne $result.RewriteSegmentSeconds) { [void]$lines.Add(("- 書き直しの区画（{0} gram）{1} 秒" -f (formatNumber $result.RewriteGrams), $result.RewriteSegmentSeconds)) }
                 [void]$lines.Add("")
             }
             "merge" {
                 [void]$lines.Add(("#### まとめ直し（区画 {0} 個）" -f $result.Segments))
                 [void]$lines.Add("")
                 [void]$lines.Add(("- 合計 {0} 秒（区画の読み込み {1}・集める {2}・並べ替え {3}・まとめる {4}・書く {5}）、最大メモリ {6} MB、結果 {7} MB" -f $result.TotalSeconds, $result.LoadSeconds, $result.GatherSeconds, $result.SortSeconds, $result.GroupSeconds, $result.WriteSeconds, $result.PeakMegabytes, (formatNumber ($result.TotalBytes / 1MB))))
+                [void]$lines.Add("")
+            }
+            "defenderon" {
+                [void]$lines.Add("#### Defender のリアルタイム保護を有効にする試み")
+                [void]$lines.Add("")
+                [void]$lines.Add(("- 前: " + ($result.Before | ConvertTo-Json -Compress)))
+                [void]$lines.Add(("- 設定したときのメッセージ: " + $result.SetMessage))
+                [void]$lines.Add(("- 後: " + ($result.After | ConvertTo-Json -Compress)))
+                [void]$lines.Add("")
+            }
+            "share" {
+                [void]$lines.Add("#### 地図で開いている間の削除・移動・入れ替え")
+                [void]$lines.Add("")
+                [void]$lines.Add("| 試し | 成否 | ms | 開いたままの読み出し | 例外 |")
+                [void]$lines.Add("|---|---|---|---|---|")
+                foreach ($probe in $result.Probes) {
+                    [void]$lines.Add(("| {0} | {1} | {2} | {3} | {4} |" -f $probe.Name, $probe.Succeeded, $probe.Ms, $probe.ReadableAfter, $probe.Error))
+                }
+                [void]$lines.Add("")
+                [void]$lines.Add("| 世代の入れ替え | 成否 | ms | 例外 |")
+                [void]$lines.Add("|---|---|---|---|")
+                foreach ($step in $result.Flow) {
+                    [void]$lines.Add(("| {0} | {1} | {2} | {3} |" -f $step.Name, $step.Succeeded, $step.Ms, $step.Error))
+                }
+                [void]$lines.Add("")
+                [void]$lines.Add(("- " + ($result.FlowSummary | ConvertTo-Json -Compress)))
                 [void]$lines.Add("")
             }
             "defender" {
@@ -1207,6 +1567,8 @@ switch ($Stage) {
     "segbuild" { invokeSegmentBuild }
     "merge" { invokeMerge }
     "segsearch" { invokeSegmentSearch }
+    "defenderon" { invokeDefenderOn }
+    "share" { invokeShare }
     "defender" { invokeDefender }
     "summary" { invokeSummary }
 }
