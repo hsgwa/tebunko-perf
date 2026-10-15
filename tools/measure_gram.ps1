@@ -5,6 +5,7 @@
 # Add-Type・P/Invoke・子プロセスは使わない（段階ごとに別のプロセスで動かすのは、呼ぶ側のワークフロー）。
 #
 # 段階（-Stage）:
+#   どの段階も、前の段階が作るフォルダが無くても落ちずに動くこと（無いものは記録して続ける）。手元の確かめは、段階ごとに別のプロセスで単独に流す。
 #   defenderon リアルタイム保護を有効にする方向に設定を変え、前後の状態を記録する（無効にする方向の変更はしない）
 #   prep      データを作り（または読み）、ファイルごと・ブロックごとの 2-gram の集合を Work\grams に書く。検索語の表も作る
 #   build     -Shape（list / bitset / mixed）と -Unit（files / blocks）の表を作る。-Label で結果の名前に印を付ける（-Parts を変えた作り直しなど）
@@ -1386,7 +1387,7 @@ function invokeShare {
             $row = tryShareAction $case.Name {
                 if ($kind -eq "delete") { [System.IO.File]::Delete($path) }
                 elseif ($kind -eq "move") { [System.IO.File]::Move($path, $moved) }
-                else { [void][System.IO.File]::Replace($other, $path, $null) }
+                else { [void][System.IO.File]::Replace($other, $path, [NullString]::Value) }
             }
             $readable = $true
             try {
@@ -1401,7 +1402,7 @@ function invokeShare {
     $indexNew = Join-Path $probeFolder "manifest.new"
     [System.IO.File]::WriteAllText($indexPath, "gen1", $utf8NoBom)
     [System.IO.File]::WriteAllText($indexNew, "gen2", $utf8NoBom)
-    [void]$probes.Add((tryShareAction "manifest_replace" { [void][System.IO.File]::Replace($indexNew, $indexPath, $null) }))
+    [void]$probes.Add((tryShareAction "manifest_replace" { [void][System.IO.File]::Replace($indexNew, $indexPath, [NullString]::Value) }))
     $closedPath = Join-Path $probeFolder "closed.bin"
     newProbeFile $closedPath
     $closedHandle = openMapped $closedPath $true $shareAll
@@ -1431,7 +1432,7 @@ function invokeShare {
             $manifestNew = Join-Path $Work "share_manifest.new"
             [System.IO.File]::WriteAllText($manifest, "gen1", $utf8NoBom)
             [System.IO.File]::WriteAllText($manifestNew, "gen2", $utf8NoBom)
-            [void]$flow.Add((tryShareAction "swap_manifest" { [void][System.IO.File]::Replace($manifestNew, $manifest, $null) }))
+            [void]$flow.Add((tryShareAction "swap_manifest" { [void][System.IO.File]::Replace($manifestNew, $manifest, [NullString]::Value) }))
             # 古い世代を、開いたまま消す
             foreach ($name in $names) {
                 $target = Join-Path $genFolder $name
@@ -1440,7 +1441,8 @@ function invokeShare {
             [void]$flow.Add((tryShareAction "delete_old_folder" { [System.IO.Directory]::Delete($genFolder) }))
             $stillReadable = $true
             try { [void]$handles["dict.bin"].View.ReadUInt32(0) } catch { $stillReadable = $false }
-            $remainWhileOpen = @([System.IO.Directory]::GetFileSystemEntries($genFolder)).Count
+            # 開いたまま Directory.Delete が通ると、フォルダはもう無い（一覧する前に有無を見る。無いときは -1）
+            $remainWhileOpen = if ([System.IO.Directory]::Exists($genFolder)) { @([System.IO.Directory]::GetFileSystemEntries($genFolder)).Count } else { -1 }
         } finally { foreach ($name in $names) { closeMapped $handles[$name] } }
         $remainAfterClose = if ([System.IO.Directory]::Exists($genFolder)) { @([System.IO.Directory]::GetFileSystemEntries($genFolder)).Count } else { 0 }
         $folderStillThere = [System.IO.Directory]::Exists($genFolder)
