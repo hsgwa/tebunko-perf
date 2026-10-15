@@ -1,0 +1,182 @@
+# 2-gram 索引の形ごとの大きさ・作成時間・検索時間・最大メモリを測る（tools/measure_gram.ps1）。
+# 測る道具を直した push と、その PR で動く。結果はジョブの Summary と artifact に出す。
+#
+# データは 2 通りを別のジョブで測る。
+#   perfdata: tebunko-perfdata の new_index.ps1 で作る約 1GB の索引（部署ごと・年度ごとのフォルダを本文インデックス 1 ファイルに見立てる）
+#   zipf:     語の出方に偏りを付けた乱数の文章（本文インデックス 502 ファイル。ファイルごとにほぼ 1 回しか出ない gram を含む）
+# 段階（prep・build・search など）はそれぞれ別のプロセスで動かす。最大メモリは段階ごとに測れる。
+# 測る段階が 1 つ落ちても、ほかの段階の結果は残す（最後に、結果の足りない段階を数えて失敗にする）。
+# run の中は ASCII だけで書く（Windows PowerShell 5.1 は BOM の無いスクリプトを ANSI として読むため。日本語は計測スクリプトの側で出力する）。
+name: gram
+
+on:
+  push:
+    paths:
+      - "tools/measure_gram.ps1"
+      - ".github/workflows/gram.yml"
+  pull_request:
+    paths:
+      - "tools/measure_gram.ps1"
+      - ".github/workflows/gram.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gram-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # データ生成スクリプトのリポジトリ（https://github.com/hsgwa/tebunko-perfdata）のコミット。更新するときは手で書き換える
+  PERFDATA_SHA: 2d6c7a60ed9ae9949cc76f8ff00762d45707ee3a
+
+jobs:
+  gram:
+    name: gram (${{ matrix.dataset }})
+    runs-on: windows-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        dataset: [perfdata, zipf]
+    env:
+      DATASET: ${{ matrix.dataset }}
+      MEASURE: .\tools\measure_gram.ps1
+    steps:
+      - name: チェックアウトする
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: データ生成スクリプトをチェックアウトする
+        if: ${{ matrix.dataset == 'perfdata' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: hsgwa/tebunko-perfdata
+          ref: ${{ env.PERFDATA_SHA }}
+          path: perfdata
+          persist-credentials: false
+
+      - name: データを生成する（perfdata）
+        if: ${{ matrix.dataset == 'perfdata' }}
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $watch = [System.Diagnostics.Stopwatch]::StartNew()
+          & .\perfdata\tools\new_index.ps1 -Dest (Join-Path $env:RUNNER_TEMP "gram\index") -Scale 1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Write-Host ("data seconds: {0}" -f $watch.Elapsed.TotalSeconds)
+
+      - name: 2-gram の集合を求める（prep）
+        shell: powershell
+        run: |
+          & $env:MEASURE -Stage prep -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out") -Index (Join-Path $env:RUNNER_TEMP "gram\index") -Scale 1 -Workers 4
+
+      - name: 表を作る（list / files）
+        id: build_list_files
+        continue-on-error: true
+        shell: powershell
+        run: |
+          & $env:MEASURE -Stage build -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out") -Shape list -Unit files
+
+      - name: 表を作る（bitset / files）
+        id: build_bitset_files
+        continue-on-error: true
+        shell: powershell
+        run: |
+          & $env:MEASURE -Stage build -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out") -Shape bitset -Unit files
+
+      - name: 表を作る（mixed / files）
+        id: build_mixed_files
+        continue-on-error: true
+        shell: powershell
+        run: |
+          & $env:MEASURE -Stage build -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out") -Shape mixed -Unit files
+
+      - name: 表を作る（list / blocks）
+        id: build_list_blocks
+        continue-on-error: true
+        shell: powershell
+        run: |
+          & $env:MEASURE -Stage build -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out") -Shape list -Unit blocks
+
+      - name: 検索する（list / files）
+        continue-on-error: true
+        shell: powershell
+        run: |
+          & $env:MEASURE -Stage search -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out") -Shape list -Unit files -Repeat 5
+
+      - name: 検索する（bitset / files）
+        continue-on-error: true
+        shell: powershell
+        run: |
+          & $env:MEASURE -Stage search -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out") -Shape bitset -Unit files -Repeat 5
+
+      - name: 検索する（mixed / files）
+        continue-on-error: true
+        shell: powershell
+        run: |
+          & $env:MEASURE -Stage search -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out") -Shape mixed -Unit files -Repeat 5
+
+      - name: 検索する（list / blocks）
+        continue-on-error: true
+        shell: powershell
+        run: |
+          & $env:MEASURE -Stage search -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out") -Shape list -Unit blocks -Repeat 5
+
+      - name: 区画を追加する時間を測る（segbuild）
+        continue-on-error: true
+        shell: powershell
+        run: |
+          & $env:MEASURE -Stage segbuild -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out")
+
+      - name: 区画をまとめ直す（2 区画）
+        continue-on-error: true
+        shell: powershell
+        run: |
+          & $env:MEASURE -Stage merge -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out") -SegmentCount 2
+
+      - name: 区画をまとめ直す（8 区画）
+        continue-on-error: true
+        shell: powershell
+        run: |
+          & $env:MEASURE -Stage merge -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out") -SegmentCount 8
+
+      - name: 区画が 8 つのときの検索を測る（segsearch）
+        continue-on-error: true
+        shell: powershell
+        run: |
+          & $env:MEASURE -Stage segsearch -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out") -SegmentCount 8 -Repeat 5
+
+      - name: 大きいファイルを初めて開く時間を測る（defender）
+        continue-on-error: true
+        shell: powershell
+        run: |
+          & $env:MEASURE -Stage defender -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out")
+
+      - name: 結果を Summary に書き出す
+        if: always()
+        shell: powershell
+        run: |
+          & $env:MEASURE -Stage summary -Dataset $env:DATASET -Work (Join-Path $env:RUNNER_TEMP "gram\work") -Out (Join-Path $env:RUNNER_TEMP "gram\out")
+
+      - name: 結果を artifact にアップロードする
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gram-${{ matrix.dataset }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/gram/out
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: 結果の足りない段階を数える
+        if: always()
+        shell: powershell
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "gram\out"
+          $names = @("prep_$env:DATASET", "build_${env:DATASET}_list_files", "build_${env:DATASET}_bitset_files", "build_${env:DATASET}_mixed_files", "build_${env:DATASET}_list_blocks", "search_${env:DATASET}_list_files", "search_${env:DATASET}_bitset_files", "search_${env:DATASET}_mixed_files", "search_${env:DATASET}_list_blocks", "segbuild_$env:DATASET", "merge_${env:DATASET}_2", "merge_${env:DATASET}_8", "segsearch_$env:DATASET", "defender_$env:DATASET")
+          $missing = @($names | Where-Object { !(Test-Path -LiteralPath (Join-Path $out "$_.json")) })
+          if ($missing.Count -gt 0) {
+            Write-Host ("missing results: " + ($missing -join ", "))
+            exit 1
+          }
