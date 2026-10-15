@@ -5,8 +5,8 @@
 # Add-Type・P/Invoke・子プロセスは使わない（段階ごとに別のプロセスで動かすのは、呼ぶ側のワークフロー）。
 #
 # 段階（-Stage）:
-#   前の段階の結果が要る段階（無いと止まる）: build・segbuild・merge・segsearch は prep の grams\meta.json、search は prep の queries.json・unitfile.bin と build の表、
-#   merge は segbuild の seg_base、segsearch は merge の merged_N と build の shape_list_files を読む。
+#   前の段階の結果が要る段階（無いと止まる）: build・segbuild・merge・segsearch は prep の grams\meta.json、search は prep の queries.json と build の表・unitfile.bin・結果の JSON、
+#   merge は segbuild の seg_base、segsearch は segbuild の seg_base・seg_N・seg_rewrite、merge の merged_N、build の shape_list_files を読む。
 #   defenderon・prep・summary は単独で動く。share・defender は、前の段階のファイルが無ければ、その項目を飛ばして記録する。
 #   defenderon リアルタイム保護を有効にする方向に設定を変え、前後の状態を記録する（無効にする方向の変更はしない）
 #   prep      データを作り（または読み）、ファイルごと・ブロックごとの 2-gram の集合を Work\grams に書く。検索語の表も作る
@@ -1298,7 +1298,7 @@ function invokeDefender {
 # ---------------------------------------------------------------- defenderon（リアルタイム保護を有効にする試み）
 
 function isCiRunner {
-    return ($env:GITHUB_ACTIONS -eq "true")
+    return ($env:GITHUB_ACTIONS -eq "true" -and $env:RUNNER_ENVIRONMENT -eq "github-hosted")
 }
 
 function getDefenderState {
@@ -1354,8 +1354,9 @@ function invokeDefenderOn {
     }
     Start-Sleep -Seconds 5
     $after = getDefenderState
-    $stillCovered = $false
+    $stillCovered = $null
     if ($after.Contains("ExclusionPath")) {
+        $stillCovered = $false
         foreach ($exclusion in $after.ExclusionPath) { if (testExclusionCovers $exclusion $target) { $stillCovered = $true } }
     }
     writeResult "defenderon_$Dataset" ([ordered]@{ Type = "defenderon"; Dataset = $Dataset; WorkFolderExcludedAfter = $stillCovered; RemovedExclusions = $removed.ToArray(); RemoveMessages = $removeMessages.ToArray(); Before = $before; SetMessage = $message; After = $after })

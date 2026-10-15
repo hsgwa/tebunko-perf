@@ -70,7 +70,7 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           Write-Host ("data seconds: {0}" -f $watch.Elapsed.TotalSeconds)
 
-      - name: Defender のリアルタイム保護を有効にする（実行機の上だけ。無効にする方向はしない）
+      - name: Defender のリアルタイム保護を有効にし、作業フォルダを含む除外を外す（実行機の上だけ。弱める方向はしない）
         continue-on-error: true
         shell: powershell
         run: |
@@ -208,20 +208,42 @@ jobs:
             Write-Host ("missing results: " + ($missing -join ", "))
             exit 1
           }
-          # Fail on: Missing > 0 for file-unit searches, DifferentCandidates > 0, RewriteCheck.OldStaleNewest > 0.
-          # Block-unit searches (search_*_blocks) may miss words that cross a block boundary, so they are skipped.
+          # Fail on: empty Methods or ByKind, a missing Missing value (file-unit searches only), Missing > 0 (file-unit searches only),
+          # DifferentCandidates > 0 or missing, RewriteCheck missing or OldWordCount = 0 or OldStaleNewest > 0 or NewFoundNewest != NewWordCount,
+          # defenderon skipped or the work folder still excluded or real-time protection not enabled.
+          # Block-unit searches (search_*_blocks) may miss words that cross a block boundary, so their Missing is allowed.
           $problems = New-Object System.Collections.ArrayList
           foreach ($name in $names) {
-            if ($name -like "*_blocks" -or ($name -notlike "search_*" -and $name -notlike "segsearch_*")) { continue }
+            $isSearch = ($name -like "search_*" -or $name -like "segsearch_*")
+            if (!$isSearch -and $name -notlike "defenderon_*") { continue }
             $result = Get-Content -LiteralPath (Join-Path $out "$name.json") -Raw -Encoding UTF8 | ConvertFrom-Json
-            foreach ($method in $result.Methods.PSObject.Properties) {
-              foreach ($kind in $method.Value.ByKind.PSObject.Properties) {
-                if ([int]$kind.Value.Missing -gt 0) { [void]$problems.Add("$name $($method.Name) $($kind.Name) Missing=$($kind.Value.Missing)") }
+            if ($name -like "defenderon_*") {
+              if ($null -ne $result.Skipped) { [void]$problems.Add("$name skipped") }
+              elseif ($result.WorkFolderExcludedAfter -ne $false) { [void]$problems.Add("$name WorkFolderExcludedAfter=$($result.WorkFolderExcludedAfter)") }
+              elseif ($result.After.RealTimeProtectionEnabled -ne $true) { [void]$problems.Add("$name After.RealTimeProtectionEnabled=$($result.After.RealTimeProtectionEnabled)") }
+              continue
+            }
+            $methods = @($result.Methods.PSObject.Properties)
+            if ($methods.Count -eq 0) { [void]$problems.Add("$name has no Methods") }
+            foreach ($method in $methods) {
+              $kinds = @($method.Value.ByKind.PSObject.Properties)
+              if ($kinds.Count -eq 0) { [void]$problems.Add("$name $($method.Name) has no ByKind") }
+              if ($name -like "*_blocks") { continue }
+              foreach ($kind in $kinds) {
+                if ($null -eq $kind.Value.Missing) { [void]$problems.Add("$name $($method.Name) $($kind.Name) has no Missing") }
+                elseif ([int]$kind.Value.Missing -gt 0) { [void]$problems.Add("$name $($method.Name) $($kind.Name) Missing=$($kind.Value.Missing)") }
               }
             }
             if ($name -like "segsearch_*") {
-              if ([int]$result.DifferentCandidates -gt 0) { [void]$problems.Add("$name DifferentCandidates=$($result.DifferentCandidates)") }
-              if ($null -ne $result.RewriteCheck -and [int]$result.RewriteCheck.OldStaleNewest -gt 0) { [void]$problems.Add("$name RewriteCheck.OldStaleNewest=$($result.RewriteCheck.OldStaleNewest)") }
+              if ($null -eq $result.DifferentCandidates) { [void]$problems.Add("$name has no DifferentCandidates") }
+              elseif ([int]$result.DifferentCandidates -gt 0) { [void]$problems.Add("$name DifferentCandidates=$($result.DifferentCandidates)") }
+              $rewrite = $result.RewriteCheck
+              if ($null -eq $rewrite) { [void]$problems.Add("$name has no RewriteCheck") }
+              else {
+                if ([int]$rewrite.OldWordCount -le 0) { [void]$problems.Add("$name RewriteCheck.OldWordCount=$($rewrite.OldWordCount)") }
+                if ([int]$rewrite.OldStaleNewest -gt 0) { [void]$problems.Add("$name RewriteCheck.OldStaleNewest=$($rewrite.OldStaleNewest)") }
+                if ([int]$rewrite.NewFoundNewest -ne [int]$rewrite.NewWordCount) { [void]$problems.Add("$name RewriteCheck.NewFoundNewest=$($rewrite.NewFoundNewest) NewWordCount=$($rewrite.NewWordCount)") }
+              }
             }
           }
           if ($problems.Count -gt 0) {
